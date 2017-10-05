@@ -23,6 +23,9 @@ import "labrpc"
 import "time"
 import "math/rand"
 import "fmt"
+import "bytes"
+import "encoding/gob"
+
 
 // import "bytes"
 // import "encoding/gob"
@@ -184,7 +187,16 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+    // rf.persister.SaveRaftState(data)
+    w := new(bytes.Buffer)
+    e := gob.NewEncoder(w)
+    e.Encode(rf.Term)
+    e.Encode(rf.LeaderElect.HasVoted)
+    e.Encode(rf.LogReplica.Log)
+    data := w.Bytes()
+    rf.persister.SaveRaftState(data)
+    
+
 }
 
 //
@@ -200,7 +212,14 @@ func (rf *Raft) readPersist(data []byte) {
 	// d.Decode(&rf.yyy)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
-	}
+    }
+    
+    r := bytes.NewBuffer(data)
+    d := gob.NewDecoder(r)
+    d.Decode(&rf.Term)
+    d.Decode(&rf.LeaderElect.HasVoted)
+    d.Decode(&rf.LogReplica.Log)
+    return
 }
 
 // request vote
@@ -377,6 +396,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
     
+    rf.persist()
     ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -542,6 +562,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
     
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
 
+    rf.persist()
     ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
     return ok
 }
