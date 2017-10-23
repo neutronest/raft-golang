@@ -21,6 +21,7 @@ import "sync"
 import "labrpc"
 
 import "time"
+import "math"
 import "math/rand"
 import "fmt"
 import "bytes"
@@ -41,6 +42,11 @@ const (
 const TICK_TIME = 50
 const APPENDTYPE_HEARTBEAT = 0
 const APPENDTYPE_COMMAND = 1
+
+const REPLICA_SAFE_APPEND = 0
+const REPLICA_LAST_ENTRY_DIFF = 1
+const REPLICA_CURRENT_ENTRY_DIFF = 2 
+const REPLICA_HISTORY_MISSIING = 3
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -72,7 +78,7 @@ type LogEntry struct {
     Command interface{}
 }
 
-func NewLogEntry(term int, index int, command interface{}) *LogEntry {
+func NewLogEntry(term int, index int,  command interface{}) *LogEntry {
     
     logEntry := &LogEntry{}
     logEntry.Term = term
@@ -96,13 +102,17 @@ type LeaderElect struct {
     PeerStates []int
 }
 
-type LogReplica struct {
+type Replica struct {
 
     // the elements of Log Replication
 
     // local log storage
     // store all history command entries
     Log []*LogEntry
+
+    // the offset of the sum length
+    // of all entries in the snapshots
+    Offset int
 
     // the commited highest index
     CommitIndex int
@@ -155,7 +165,7 @@ type Raft struct {
 
     LeaderElect *LeaderElect
 
-    LogReplica *LogReplica
+    Replica *Replica
 }
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -192,7 +202,8 @@ func (rf *Raft) persist() {
     e := gob.NewEncoder(w)
     e.Encode(rf.Term)
     e.Encode(rf.LeaderElect.HasVoted)
-    e.Encode(rf.LogReplica.Log)
+    e.Encode(rf.Replica.Offset)
+    e.Encode(rf.Replica.Log)
     data := w.Bytes()
     rf.persister.SaveRaftState(data)
     
@@ -218,7 +229,8 @@ func (rf *Raft) readPersist(data []byte) {
     d := gob.NewDecoder(r)
     d.Decode(&rf.Term)
     d.Decode(&rf.LeaderElect.HasVoted)
-    d.Decode(&rf.LogReplica.Log)
+    d.Decode(&rf.Replica.Offset)
+    d.Decode(&rf.Replica.Log)
     return
 }
 
@@ -279,11 +291,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// 2A
-    
-
-    go func(){
-        rf.RecycleChan <- true
-    }()
 
     guestTerm := args.RequestTerm
 	//guestId := args.CandidateId
@@ -297,9 +304,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     
     lastEntryIndex := 0
     lastEntryTerm := 1
-    lenOfLog := len(rf.LogReplica.Log)
+    lenOfLog := len(rf.Replica.Log)
     if lenOfLog != 0 {
-        lastEntry := rf.LogReplica.Log[lenOfLog-1]
+        lastEntry := rf.Replica.Log[lenOfLog-1]
         lastEntryTerm = lastEntry.Term
         lastEntryIndex = lastEntry.Index
 
@@ -307,7 +314,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 
     if rf.Identity == STATE_LEADER {
-        DebugElect(DEBUG_FLAG, "fuck go back to your demmy follower!\n")
+        DebugElect(DEBUG_FLAG, 
+            "[RequestVote] leader %d become to follower.\n", 
+            rf.me)
         reply.UpdateTerm = rf.Term
         reply.ServerBrokenDeny = true
     }
@@ -325,7 +334,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     }
 
     if reply.IdentityDeny {
-        DebugElect(DEBUG_FLAG, "cadi %d is out-of-date checked by %d\n", args.CandidateId, rf.me)
+        DebugElect(DEBUG_FLAG, 
+            "[RequestVote] candidate %d's log is out-of-date.\n", 
+            args.CandidateId)
         if rf.Term < guestTerm {
             rf.Term = guestTerm
         }
@@ -358,6 +369,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if reply.IdentityDeny == false {
         reply.VoteGranted = true
         rf.LeaderElect.HasVoted = true
+        go func(){
+            rf.RecycleChan <- true
+        }() 
 
     }
 
@@ -396,8 +410,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
     
-    rf.persist()
+    
     ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+    rf.persist()
 	return ok
 }
 
@@ -424,6 +439,13 @@ type AppendEntryArgs struct {
     //// batch of entries that to be appended
     Entry LogEntry
 
+    // leader's offset
+    Offset int
+
+    /////
+    ///// Optimized!
+    EntryBatch []LogEntry
+
     // the entry index which has been committed by leader
     LeaderCommitIndex int
 	// TODO
@@ -442,6 +464,13 @@ type AppendEntryReply struct {
     // 3: follower's log has the same length but diff with leader
     AppendStatus int
     
+    // the follower's confilict entry's term
+    ConflictTerm int
+
+    // the first index that occured with conflict term
+    FirstIndexOfConflictTerm int
+
+
 	//
 	Result bool
 
@@ -478,9 +507,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
         // check term correctness
         if rf.Term > args.Term {
             // reject
-            fmt.Printf("RPC-ApplyEntry rej: follower%d-term: %d, leader%d-term: %d\n", rf.me, rf.Term, args.LeaderId, args.Term)
             reply.UpdateTerm = rf.Term
             reply.Result = false
+            DebugReplica(DEBUG_FLAG, 
+                "[AppendEntry] follower %d's term > leader %d's term\n",
+                rf.me, rf.Term, args.LeaderId, args.Term)
             return
         }
         // if follower's term < leader's term
@@ -490,70 +521,124 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
         }
 
         // check consistency
-        lastLeaderTerm := args.PrevLogTerm
-        lastLeaderIndex := args.PrevLogIndex
-        lenOfLog := len(rf.LogReplica.Log)
+        prevLeaderTerm := args.PrevLogTerm
+        prevLeaderIndex := args.PrevLogIndex
+        //prevLLogTerm := args.PrevLogTerm
+        prevCus := prevLeaderIndex - args.Offset
+        
+        lenOfLog := len(rf.Replica.Log)
 
-        lastLeaderLogPos := args.PrevLogIndex-1
-        newLeaderLogPos := lastLeaderLogPos + 1
-
-        // check if contain an entry at prevLogTerm-prevLogIndex
-        reply.AppendStatus = 0
-        if lastLeaderLogPos > 0 && lenOfLog > lastLeaderLogPos {
-            lastEntry := rf.LogReplica.Log[lastLeaderLogPos]
-            if lastEntry.Term != lastLeaderTerm || lastEntry.Index != lastLeaderIndex {
+        // check if follower exist an entry at prevLogTerm-prevLogIndex
+        reply.AppendStatus = REPLICA_SAFE_APPEND
+        
+        if prevLeaderIndex > 0 && lenOfLog > prevCus {
+            prevEntry := rf.Replica.Log[prevCus]
+            if prevEntry.Term != prevLeaderTerm || prevEntry.Index != prevLeaderIndex {
+                
+                // prevLogTerm/Index is differenct
+                // delete follower's entry after Log[Index-1]
+                // mark the conflict term as prevEntry.Term
+                
                 // delete all after entries
-                DebugReplica(DEBUG_FLAG, "*** node %d delete all entries after index:%d\n", rf.me, lastLeaderLogPos+1)
-                rf.LogReplica.Log = rf.LogReplica.Log[:(lastLeaderLogPos)]
-                GetLogInfo(rf)
-                reply.AppendStatus = 1
-            } else if lenOfLog > newLeaderLogPos {
-                // if the follower has got entry at same index, check if consist
-                curEntry := rf.LogReplica.Log[newLeaderLogPos]
-                if curEntry.Term != args.Entry.Term || curEntry.Index != args.Entry.Index {
-                    // delete all after entries
-                    DebugReplica(DEBUG_FLAG, "&&& node %d delete all entries after index:%d\n", rf.me, lastLeaderIndex+1)
-                    rf.LogReplica.Log = rf.LogReplica.Log[:newLeaderLogPos]
-                    GetLogInfo(rf)
+                rf.Replica.Log = rf.Replica.Log[:prevCus]
+                
+                // mark the conflictTerm and the first index with that term
+                reply.ConflictTerm = prevEntry.Term
+                curPos := prevCus-1
+                for curPos > 0 && rf.Replica.Log[curPos].Term == prevEntry.Term {
+                    curPos -= 1
                 }
+                reply.FirstIndexOfConflictTerm = (curPos+1) + 1
+                reply.AppendStatus = REPLICA_LAST_ENTRY_DIFF
+                DebugReplica(DEBUG_FLAG, 
+                    "[AppendEntry] follower %d: prevLog's Term/Index has diff.\n"+
+                    "delete all entries after prev-index.\n"+
+                    "diff: prevFInfo: %d-%d, prevLInfo: %d-%d\n",
+                    rf.me, prevEntry.Term, prevEntry.Index,
+                    prevLeaderTerm, prevLeaderIndex)
+                //GetLogInfo(rf)                
             }
-
-
-        } else if lenOfLog < lastLeaderIndex {
+        } 
+        
+        if lenOfLog > prevCus+1 {
+            // if the follower has got entry at same index, check if consist
+            DebugReplica(DEBUG_FLAG, 
+                "[AppendEntry] follower %d: has one same entry on target place\n",
+                rf.me)
+            rf.Replica.Log = rf.Replica.Log[:(prevCus+1)]
+            //GetLogInfo(rf)   
+        } else if lenOfLog <= prevCus {
             // not enough entry
-            reply.AppendStatus = 1
-            DebugReplica(DEBUG_FLAG, "*** node %d entry len is not enough\n", rf.me)
-            GetLogInfo(rf)
+            // the conflict term is the last entry's term
+            reply.AppendStatus = REPLICA_HISTORY_MISSIING
+            lEntry := rf.Replica.Log[len(rf.Replica.Log)-1]
+            lTerm := lEntry.Term
+            reply.ConflictTerm = lEntry.Term
+            curPos := len(rf.Replica.Log)-1
+            for lEntry.Term == lTerm {
+                curPos -= 1
+                if curPos < 0 {
+                    curPos = 0
+                    break
+                }
+                lEntry = rf.Replica.Log[curPos]
+            }
+            if lEntry.Term == lTerm || curPos == 0 {
+                // at the head of log
+                reply.FirstIndexOfConflictTerm = rf.Replica.Log[0].Index
+            } else {
+                // move forward
+                reply.FirstIndexOfConflictTerm = rf.Replica.Log[curPos+1].Index
+            }
+            
+            DebugReplica(DEBUG_FLAG, 
+                "[AppendEntry] follower %d: not enough entry at prevLogIndex...\n",
+                rf.me)
         }
     
 
-        if reply.AppendStatus == 0 && args.AppendType == 1 {
+        if reply.AppendStatus == REPLICA_SAFE_APPEND && args.AppendType == 1 {
             
-            newEntry := NewLogEntry(args.Entry.Term, args.Entry.Index, args.Entry.Command)
-            rf.LogReplica.Log = append(rf.LogReplica.Log, newEntry)
+
+            // append the leader's entry
+            // batch version
+            lenOfBatch := len(args.EntryBatch)
+            for i := 0; i < lenOfBatch; i++ {
+                item := args.EntryBatch[i]
+                newEntry := NewLogEntry(item.Term, item.Index, item.Command)
+                rf.Replica.Log = append(rf.Replica.Log, newEntry)
+            }
+            //GetLogInfo(rf)
+            rf.persist()
         }
 
         go func() {
             rf.HeartBeatChan <- true 
         }()
 
-        if reply.AppendStatus != 0 {
+        if reply.AppendStatus != REPLICA_SAFE_APPEND {
+            reply.Result = false
             return
         }
 
+        // begint the commit progress only when REPLICA_STATUS = REPLICA_SAFE_APPEND 
         // if follower's commitIndex < leader's latest commitIndex
         // and /
-        if rf.LogReplica.CommitIndex < args.LeaderCommitIndex && len(rf.LogReplica.Log) >= args.LeaderCommitIndex {
+        if rf.Replica.CommitIndex < args.LeaderCommitIndex && len(rf.Replica.Log) >= args.LeaderCommitIndex {
             
-
-            DebugReplica(DEBUG_FLAG, "fow %d commit by args info: %+v\n",rf.me, args)
-            rf.LogReplica.CommitIndex += 1
-            DebugReplica(DEBUG_FLAG, "follower %d: commitIndex:%d\n", rf.me, rf.LogReplica.CommitIndex)
-            entry := rf.LogReplica.Log[rf.LogReplica.CommitIndex-1]
-            msg := NewApplyMsg(entry.Index, entry.Command, false, nil)
+            // TODO
             go func() {
-                rf.ApplyMsgChan <- *msg
+                rf.Replica.CommitIndex += 1
+                entry := rf.Replica.Log[rf.Replica.CommitIndex-1]
+                msg := NewApplyMsg(entry.Index, entry.Command, false, nil)
+                go func() {
+                    rf.ApplyMsgChan <- *msg
+                }()
+                DebugReplica(DEBUG_FLAG,
+                    "[AppendEntry] follower %d: commit index update: %d.\n",
+                    rf.me, rf.Replica.CommitIndex)
             }()
+
         }
         // trigger: update the server connect
         reply.Result = true
@@ -562,8 +647,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
     
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
 
-    rf.persist()
     ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+    rf.persist()
     return ok
 }
 
@@ -607,12 +692,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
     term := rf.Term
     
-    curIndex := len(rf.LogReplica.Log)
-    entry := NewLogEntry(term, curIndex+1, command)
-    rf.LogReplica.Log = append(rf.LogReplica.Log, entry)
-    rf.LogReplica.MatchIndex[rf.me] = len(rf.LogReplica.Log)
+    lenOfLog := len(rf.Replica.Log)
+    entry := NewLogEntry(term, lenOfLog + rf.Replica.Offset, command)
+    rf.Replica.Log = append(rf.Replica.Log, entry)
+    rf.Replica.MatchIndex[rf.me] = len(rf.Replica.Log)
     GetLogInfo(rf)
-	return curIndex+1, term, true
+	return entry.Index, term, true
 }
 
 //
@@ -643,11 +728,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
-	rf.me = me
+    rf.me = me
+    
     rf.AppendEntryChan = make(chan LogEntry, 1)
-    rf.ToLeaderChan = make(chan bool, 1)
-    rf.RecycleChan = make(chan bool, 1)
-    rf.HeartBeatChan = make(chan bool, 1)
+    rf.ToLeaderChan = make(chan bool, 100)
+    rf.RecycleChan = make(chan bool, 100)
+    rf.HeartBeatChan = make(chan bool, 100)
     rf.ApplyMsgChan = applyCh
 
     LeaderElect := &LeaderElect{}
@@ -656,14 +742,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
     LeaderElect.PeerStates = make([]int, len(rf.peers))
     rf.LeaderElect = LeaderElect
 
-    logReplica := &LogReplica{}
+    logReplica := &Replica{}
     logReplica.Log = make([]*LogEntry, 0)
     logReplica.CommitIndex = 0
     logReplica.LastAppliedIndex = 0
+    logReplica.Offset = 1
     logReplica.NextIndex = make([]int, len(rf.peers), len(rf.peers))
 
     logReplica.MatchIndex = make([]int, len(rf.peers), len(rf.peers))
-    rf.LogReplica = logReplica
+    rf.Replica = logReplica
     
 
 	// Timter init
@@ -675,7 +762,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+    DebugReplica(DEBUG_FLAG, 
+        "[Make] server %d: start.\n", rf.me)
 	return rf
 }
 
@@ -709,10 +797,10 @@ func (rf *Raft) ToLeader() {
 	rf.Identity = STATE_LEADER
 	rf.LeaderElect.VotedGrantNum = 0
 	rf.LeaderElect.HasVoted = false
-    rf.LogReplica.NextIndex = make([]int, len(rf.peers))
-    LenOfLog := len(rf.LogReplica.Log)
+    rf.Replica.NextIndex = make([]int, len(rf.peers))
+    LenOfLog := len(rf.Replica.Log)
     for idx :=0; idx < len(rf.peers); idx++ {
-        rf.LogReplica.NextIndex[idx] = LenOfLog+1
+        rf.Replica.NextIndex[idx] = LenOfLog + rf.Replica.Offset
     }
     GetLogInfo(rf)
 }
@@ -745,17 +833,19 @@ func (rf *Raft) BoardcastRequestVote() {
                 rf.LeaderElect.PeerStates[idx_val] = 1
                 return
             }
-            DebugElect(DEBUG_FLAG, "%d set request vote to %d\n", rf.me, idx_val)
-            lenOfLog := len(rf.LogReplica.Log)
+            DebugElect(DEBUG_FLAG, 
+                "[Send VoteRequest] leader %d: set request vote to %d\n", 
+                rf.me, idx_val)
+            lenOfLog := len(rf.Replica.Log)
 
             voteArgs := RequestVoteArgs{}
             voteArgs.RequestIdentity = rf.Identity
             voteArgs.RequestTerm = rf.Term
             voteArgs.CandidateId = rf.me
             if lenOfLog != 0 {
-                lastEntry := rf.LogReplica.Log[lenOfLog-1]
-                voteArgs.LastLogTerm = lastEntry.Term
-                voteArgs.LastLogIndex = lastEntry.Index
+                lEntry := rf.Replica.Log[lenOfLog-1]
+                voteArgs.LastLogTerm = lEntry.Term
+                voteArgs.LastLogIndex = lEntry.Index
             } else {
                 voteArgs.LastLogTerm = 1
                 voteArgs.LastLogIndex = 0
@@ -766,7 +856,6 @@ func (rf *Raft) BoardcastRequestVote() {
             voteReply.ServerBrokenDeny = false
             ok := rf.sendRequestVote(idx_val, &voteArgs, &voteReply)
             if !ok {
-                //DebugElect(DEBUG_FLAG, "%d has been disconnected \n", idx_val)
                 rf.LeaderElect.PeerStates[idx_val] = 0
             } else {
                 rf.LeaderElect.PeerStates[idx_val] = 1
@@ -786,11 +875,14 @@ func (rf *Raft) BoardcastRequestVote() {
 
                     if voteReply.ServerBrokenDeny {
                         rf.Term = voteReply.UpdateTerm
-                        DebugElect(DEBUG_FLAG, "%d got serverbroken denied!\n", rf.me)
+                        DebugElect(DEBUG_FLAG, 
+                            "[Send VoteRequest] leader %d: got server broken denied!\n", rf.me)
                         rf.ToFollower()
                     }
                     if voteReply.IdentityDeny {
-                        DebugElect(DEBUG_FLAG, "%d got identity denied by %d\n", rf.me, idx_val)
+                        DebugElect(DEBUG_FLAG, 
+                            "[Send VoteRequest] leader %d: got identity denied by %d\n", 
+                            rf.me, idx_val)
                         rf.ToFollower()
                     }
                 } // end else...
@@ -819,10 +911,11 @@ func (rf *Raft) BoardcastAppendEntry() {
         return
     }
 
-    lenOfLog := len(rf.LogReplica.Log)
+    
     for idx :=0; idx < len(rf.peers); idx++ {
         go func(idx_val int) {
             //defer DebugReplica(DEBUG_FLAG, "%d -> %d append rpc finished\n", rf.me, idx_val)
+            lenOfLog := len(rf.Replica.Log)
             if idx_val == rf.me {
                 rf.LeaderElect.PeerStates[idx_val] = 1
                 return
@@ -831,34 +924,49 @@ func (rf *Raft) BoardcastAppendEntry() {
                 return
             }
 
-            nextIndex := rf.LogReplica.NextIndex[idx_val]
+            nextIndex := rf.Replica.NextIndex[idx_val]
             appendArgs := AppendEntryArgs{}
             appendReply := AppendEntryReply{}
 
             // default init
             appendArgs.Term = rf.Term
             appendArgs.LeaderId = rf.me
-            appendArgs.PrevLogTerm = rf.Term
+            appendArgs.PrevLogTerm = 0
             appendArgs.PrevLogIndex = 0
             appendArgs.AppendType = 1
-            appendArgs.LeaderCommitIndex = rf.LogReplica.CommitIndex
+            appendArgs.Offset = rf.Replica.Offset
+            appendArgs.LeaderCommitIndex = rf.Replica.CommitIndex
+    
+            appendReply.AppendStatus = REPLICA_SAFE_APPEND
+            appendReply.ConflictTerm = -2
+            appendReply.FirstIndexOfConflictTerm = -2
             if nextIndex-2 >= 0 {
                 // lastEntry is not empty
-                lastEntry :=  rf.LogReplica.Log[nextIndex-2]
+                lastEntry :=  rf.Replica.Log[nextIndex-2]
                 appendArgs.PrevLogIndex = lastEntry.Index
                 appendArgs.PrevLogTerm = lastEntry.Term
             }
 
-            if nextIndex-1 < len(rf.LogReplica.Log) && lenOfLog != 0 {
+            if nextIndex-1 < len(rf.Replica.Log) && lenOfLog != 0 {
                 // need to send entry to follower
-                
-            
-                entry := LogEntry(*rf.LogReplica.Log[nextIndex-1])
+                // Batch Version
+                EntryBatch := make([]LogEntry, 0)
+                for i := nextIndex-1; i < lenOfLog; i++ {
+                    entry := LogEntry(*rf.Replica.Log[i])
+                    EntryBatch = append(EntryBatch, *(NewLogEntry(entry.Term, entry.Index, entry.Command)))
+                    //appendArgs.Entry = *(NewLogEntry(entry.Term, entry.Index, entry.Command))
+                }
+                appendArgs.EntryBatch = EntryBatch
+                appendArgs.Entry = LogEntry{}
+                appendArgs.Entry.Command = nil
+                /*
+                entry := LogEntry(*rf.Replica.Log[nextIndex-1])
                 appendArgs.Entry = *(NewLogEntry(entry.Term, entry.Index, entry.Command))
-                //DebugReplica(DEBUG_FLAG, "%d -> %d, send entry %d-%d/%d \n", rf.me, idx_val, entry.Term, entry.Index, entry.Command.(int))
+                */
             } else {
                 // send heartbeats
                 appendArgs.AppendType = 0
+                appendArgs.EntryBatch = make([]LogEntry, 1)
                 appendArgs.Entry = LogEntry{}
                 appendArgs.Entry.Command = nil
             }                
@@ -881,17 +989,50 @@ func (rf *Raft) BoardcastAppendEntry() {
                     rf.ToFollower()
                     
                 }
-                if appendReply.AppendStatus == 1 {
-                    DebugReplica(DEBUG_FLAG, "get diff from %d at index %d\n", idx_val, appendArgs.Entry.Index)
-                    rf.LogReplica.NextIndex[idx_val] -= 1
-                }
+                if appendReply.AppendStatus != REPLICA_SAFE_APPEND {
+
+                    if appendArgs.AppendType == 0 {
+                        DebugReplica(DEBUG_FLAG, "this is the heartbeat but found last entry diff!\n")
+                    }
+
+
+                    // check if the conflict term existed in leader's log
+                    nIdx := nextIndex
+                    if (nIdx-1 >= len(rf.Replica.Log)) {
+                        // happened when send heartbeat but found last entry diff
+                        // the nextIndex is point to an undefined position
+                        nIdx = len(rf.Replica.Log)
+                    }
+                    DebugReplica(DEBUG_FLAG, "****leader %d: nextIndex:%d, log:%+v\n", 
+                        rf.me, nextIndex, rf.Replica.Log)
+                    GetLogInfo(rf)
+                    nEntry := rf.Replica.Log[nIdx-1]
+                    nTerm := nEntry.Term
+                    for nTerm > appendReply.ConflictTerm && nIdx-1 > 0 {
+                        nIdx -= 1
+                        nEntry =  rf.Replica.Log[nIdx-1]
+                        nTerm = nEntry.Term
+                    }
+                    if (nTerm  == appendReply.ConflictTerm) {
+                        // leader has found the conflict term
+                        nIdx = int(math.Min(float64(nIdx), float64(nextIndex-1)))                        
+                    } else {
+                        // the conflict term not exist
+                        nIdx = int(math.Min(float64(nIdx-1), float64(appendReply.FirstIndexOfConflictTerm)))
+                    }
+                    rf.Replica.NextIndex[idx_val] = nIdx
+                    DebugReplica(DEBUG_FLAG, "%d -> %d next idx is %d\n", rf.me, idx_val, nIdx)
+                } 
             } else {
                 // success append entry
                 
                 if appendArgs.AppendType == 1 {
                     DebugReplica(DEBUG_FLAG, "%d send entry to %d success\n", rf.me, idx_val)
-                    rf.LogReplica.NextIndex[idx_val] += 1
-                    rf.LogReplica.MatchIndex[idx_val] = rf.LogReplica.NextIndex[idx_val]-1
+                    /*
+                    rf.Replica.NextIndex[idx_val] += 1
+                    */
+                    rf.Replica.NextIndex[idx_val] = lenOfLog+1
+                    rf.Replica.MatchIndex[idx_val] = rf.Replica.NextIndex[idx_val]-1
                 }
             }// end applyResult
         }(idx)
@@ -917,7 +1058,7 @@ func (rf *Raft) StateMachineDriver() {
                 if entry.Command != nil {
                     DebugReplica(DEBUG_FLAG, "node %d get entry to append\n", rf.me)
                     logEntry := NewLogEntry(entry.Term, entry.Index, entry.Command)
-                    rf.LogReplica.Log = append(rf.LogReplica.Log, logEntry)
+                    rf.Replica.Log = append(rf.Replica.Log, logEntry)
                 } 
                 rf.ToFollower()
             case <- rf.RecycleChan:
@@ -935,15 +1076,7 @@ func (rf *Raft) StateMachineDriver() {
             rf.BoardcastRequestVote()
             
             select {
-            case entry :=<- rf.AppendEntryChan:
-                // the system has a leader yet!
-                // change the identity back to follower
-                if entry.Command != nil {
-                    DebugReplica(DEBUG_FLAG, "node %d get entry to append\n", rf.me)
-                    logEntry := NewLogEntry(entry.Term, entry.Index, entry.Command)
-                    rf.LogReplica.Log = append(rf.LogReplica.Log, logEntry)
-                } 
-                rf.ToFollower()
+            case <- rf.AppendEntryChan:
             case <- rf.ToLeaderChan:
                 DebugElect(DEBUG_FLAG, "candidate %d become leader!\n", rf.me)
                 rf.ToLeader()
@@ -964,18 +1097,15 @@ func (rf *Raft) StateMachineDriver() {
             // bad design: this precedure must be applied by Start RPC
             
       
-            //DebugElect(DEBUG_FLAG, "leader: %d\n", rf.me)
             rf.BoardcastAppendEntry()
             
             // check if self broken
-            //DebugElect(DEBUG_FLAG, "leader %d's peer state: %v\n",rf.me, rf.LeaderElect.PeerStates)
             activeNum := 0
             allNum := len(rf.peers)
             for idx2:=0; idx2 < allNum; idx2++ {
                 if rf.LeaderElect.PeerStates[idx2] == 1 {
                     activeNum += 1
                 } else {
-                    //DebugElect(DEBUG_FLAG, "leader %d confirm node %d is broken\n", rf.me, idx2)
                 }
             }
             if activeNum == 1 {
@@ -986,11 +1116,11 @@ func (rf *Raft) StateMachineDriver() {
 
             // update leader's commitIndex
             // get all active nodes' number
-            if rf.LogReplica.CommitIndex < len(rf.LogReplica.Log) {
+            if rf.Replica.CommitIndex < len(rf.Replica.Log) {
                 laterCommitNum := 0
                 for idx := 0; idx < allNum; idx++ {
                     if rf.LeaderElect.PeerStates[idx] == 1 {
-                        if rf.LogReplica.CommitIndex < rf.LogReplica.MatchIndex[idx] {
+                        if rf.Replica.CommitIndex < rf.Replica.MatchIndex[idx] {
                             laterCommitNum += 1
                         }
                     }
@@ -998,8 +1128,8 @@ func (rf *Raft) StateMachineDriver() {
                 
                 if float32(laterCommitNum) / float32(len(rf.peers)) > 0.5 {
                     
-                    rf.LogReplica.CommitIndex += 1
-                    entry := rf.LogReplica.Log[rf.LogReplica.CommitIndex-1]
+                    rf.Replica.CommitIndex += 1
+                    entry := rf.Replica.Log[rf.Replica.CommitIndex-1]
                     msg := NewApplyMsg(entry.Index, entry.Command, false, nil)
                     go func() {
                         rf.ApplyMsgChan <- *msg

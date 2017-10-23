@@ -550,6 +550,7 @@ func TestPersist12C(t *testing.T) {
 	cfg.one(11, servers)
 
 	// crash and re-start all
+	fmt.Printf("\n===12C: crashc and re-start all ...\n")
 	for i := 0; i < servers; i++ {
 		cfg.start1(i)
 	}
@@ -561,6 +562,7 @@ func TestPersist12C(t *testing.T) {
 	cfg.one(12, servers)
 
 	leader1 := cfg.checkOneLeader()
+	fmt.Printf("\n===12C: crash the leaderr and restart ...\n")
 	cfg.disconnect(leader1)
 	cfg.start1(leader1)
 	cfg.connect(leader1)
@@ -568,11 +570,14 @@ func TestPersist12C(t *testing.T) {
 	cfg.one(13, servers)
 
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("\n===12C: crash the new-leader and restart ...\n")
 	cfg.disconnect(leader2)
 	cfg.one(14, servers-1)
 	cfg.start1(leader2)
 	cfg.connect(leader2)
 
+	fmt.Printf("\n===12C: wait for leader2 to join before killing i3\n")
+	
 	cfg.wait(4, servers, -1) // wait for leader2 to join before killing i3
 
 	i3 := (cfg.checkOneLeader() + 1) % servers
@@ -767,15 +772,22 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	cfg.one(rand.Int()%10000, 1)
 
 	nup := servers
+
+	cmd := 1
 	for iters := 0; iters < 1000; iters++ {
 		if iters == 200 {
 			cfg.setlongreordering(true)
 		}
 		leader := -1
 		for i := 0; i < servers; i++ {
+			/*
 			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
+			*/
+			_, _, ok := cfg.rafts[i].Start(cmd)
+			cmd = cmd + 1
 			if ok && cfg.connected[i] {
 				leader = i
+				
 			}
 		}
 
@@ -799,6 +811,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 				nup += 1
 			}
 		}
+		fmt.Printf("=== Unreliable [Iter] %d\n", iters)
 	}
 
 	for i := 0; i < servers; i++ {

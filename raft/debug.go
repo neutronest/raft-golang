@@ -8,6 +8,8 @@ const ELECT = 0
 const REPLICA = 1
 const ALL = 90
 
+const LOG_PRODUCTION_LEVEL = 0
+const LOG_DEBUG_LEVEL = 1
 
 func DebugElect(flag int, msg string, args ...interface{}) {
     if flag == ELECT || flag == ALL {
@@ -24,13 +26,13 @@ func DebugReplica(flag int, msg string, args ...interface{}) {
 
 func GetLogInfo(rf *Raft) {
 
-    log := rf.LogReplica.Log
+    log := rf.Replica.Log
     lenOfLog := len(log)
     fmt.Printf("%d's log: [ ", rf.me)
     for i := 0; i < lenOfLog; i++ {
-        entry := rf.LogReplica.Log[i]
+        entry := rf.Replica.Log[i]
         fmt.Printf("%d-%d/%d ", entry.Term, entry.Index, entry.Command.(int))
     }
-    fmt.Printf("]\n ")
+    fmt.Printf("]\n")
 
 }
