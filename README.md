@@ -5,7 +5,7 @@ An experimental projects that implement a simple raft distributed protocol which
 
 # Used
 
-cd `raft && go test -run 2A(2B/2C) | grep -E "Test|Pass|Fail"`
+`cd raft && go test -run 2A(2B/2C) | grep -E "Test|Pass|Fail"`
 
 then observe the running result.
 
